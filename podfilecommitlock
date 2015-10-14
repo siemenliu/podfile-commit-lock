@@ -1,0 +1,191 @@
+#!/usr/bin/env node
+var fs = require('fs');
+var path = require('path');
+
+var arguments = process.argv.splice(2);
+
+var pathToProject = arguments[0] ? path.normalize(arguments[0]) : path.normalize('./');
+
+var pathPodfile = path.join(pathToProject, 'Podfile');
+var pathPodfileLock = path.join(pathToProject, 'Podfile.lock');
+
+// 最终解析的结果
+var dependenciesMap = {};
+
+// 1. 读取lock文件
+var contentOfPodfileLock = fs.readFileSync(pathPodfileLock, {'encoding':'utf8'});
+var lines = contentOfPodfileLock.split('\n');
+
+// 2. 解析 DEPENDENCIES
+// 找到 DEPENDENCIES 这行 从下一行开始到空行之间的内容
+function depParse(lines) {
+	var result = {useVersion:{},useGit:{}};
+	var listDep = [];
+	var flagDep = false;
+	for (var i = 0; i < lines.length; i++) {
+		var line = lines[i];
+		// console.log('line:' + line.length + ':' + line);
+		if (flagDep && line.length == 0) break;
+		if (flagDep) listDep.push(line);
+
+		if (line == 'DEPENDENCIES:') {
+			flagDep = true;
+		}
+	}
+
+	// console.log('===== DEPENDENCIES - start =====');
+	// console.log(listDep);
+	// console.log('===== DEPENDENCIES - end =====');
+
+	// - ALISCBus (from `git@gitlab.alibaba-inc.com:ALISCCommonSDK/ALISCBus.git`, branch `master`)
+	var regGit = /- (.+) \(from `(.+)`, commit `.*`, branch `(.+)`\)|- (.+) \(from `(.+)`, branch `(.+)`\)|- (.+) \(from `(.+)`\)/
+	// - arm-aliseller (~> 0.0.1)
+	var regVer = /.*- (.+) \((.+)\)/
+
+	// 区分git/version
+	for (var i = 0; i < listDep.length; i++) {
+		var line = listDep[i];
+		if (line.indexOf('(from ') != -1) {
+			// git
+			var matches = line.match(regGit);
+
+			for (var j = matches.length - 1; j > 0; j--) {
+				if (!matches[j] || matches[j].length == 0) matches.splice(j, 1);
+			}
+			var obj = {
+				pod: matches[1],
+				git: matches[2],
+				branch: matches[3] || 'master',
+			};
+
+			result.useGit[matches[1]] = obj;
+		} else {
+			// version
+			var matches = line.match(regVer);
+			var obj = {
+				pod: matches[1],
+				version: matches[2]
+			};
+
+			result.useVersion[matches[1]] = obj;
+		}
+	}
+
+	return result;
+}
+
+var maps = depParse(lines);
+
+// console.log(maps);
+
+// 3. 解析 CHECKOUT OPTIONS
+
+function checkOutParse(lines) {
+	var result = {};
+	var flag = false;
+	var aboutLines = [];
+	for (var i = 0; i < lines.length; i++) {
+		var line = lines[i];
+		if (flag && line.length == 0) break;
+		if (flag) aboutLines.push(line);
+
+		if (line == 'CHECKOUT OPTIONS:') flag = true;
+	}
+
+	var regPod = /^\s*(.+):$/;
+	var regCommit = /^\s*:commit:\s*(.+)$/;
+
+	var obj = {
+		pod: null,
+		commit: null
+	};
+	for (var i = 0; i< aboutLines.length; i++) {
+		var line = aboutLines[i];
+		// console.log(i, line);
+		if (regPod.test(line)) {
+			// 第一个pod名字不需要添加 初始pod没名字
+			if (obj.pod) result[obj.pod] = obj;
+
+			// 添加后置空
+			obj = {
+				pod: line.match(regPod)[1],
+				commit: null
+			}
+
+		} else if (regCommit.test(line)) {
+
+			// 添加
+			obj.commit = line.match(regCommit)[1];
+		}
+
+		// 或者遍历到了最后一行，肯定最后一个Pod已经组装完成了，所以也添加
+		if (i == aboutLines.length - 1) result[obj.pod] = obj;
+	}
+
+	return result;
+}
+var checkOut = checkOutParse(lines);
+console.log(checkOut);
+
+// 4. 将 DEPENDENCIES 从git获取代码的带上标记
+//    整理出依赖带有commit编号或具体版本的map
+
+var pods = Object.keys(checkOut);
+// console.log(pods);
+
+for (var i = 0; i < pods.length; i++) {
+	var pod = pods[i];
+	var commit = checkOut[pod].commit;
+	maps.useGit[pod].commit = commit;
+}
+
+console.log(' === 整理后结果 === ');
+console.log(maps);
+
+// 整理出podfile格式
+function generatePodfileContent(maps) {
+	var result = '';
+	var keysInVersion = Object.keys(maps.useVersion);
+	for (var i = 0; i < keysInVersion.length; i++) {
+		var pod = keysInVersion[i];
+		var obj = maps.useVersion[pod];
+		result += 'pod "' + pod + '", "' + obj.version + '"\n';
+	};
+
+	var keysInGit = Object.keys(maps.useGit);
+	for (var i = 0; i < keysInGit.length; i++) {
+		var pod = keysInGit[i];
+		var obj = maps.useGit[pod];
+		result += 'pod "' + pod + '", :git => "' + obj.git + '", :branch => "' + obj.branch + '", :commit => "' + obj.commit + '"\n';
+	};
+	
+
+	return '\n' + result;
+}
+var podfileContent = generatePodfileContent(maps);
+console.log(' === podfile 替换结果生成 === ');
+console.log(podfileContent);
+
+// 5. 读取podifle
+var contentOfPodfile = fs.readFileSync(pathPodfile, {encoding:'utf8'});
+var queryStart = '### DEPENDENCIES AREA - START';
+var queryEnd = '### DEPENDENCIES AREA - END';
+var indexForStart = contentOfPodfile.indexOf(queryStart) + queryStart.length;
+var indexForEnd = contentOfPodfile.indexOf(queryEnd);
+console.log('start', indexForStart, 'end', indexForEnd);
+
+// 6. 删除所有pod依赖
+var needReplace = contentOfPodfile.substring(indexForStart, indexForEnd);
+// console.log('replace', needReplace);
+
+var targetContent = contentOfPodfile.replace(needReplace, podfileContent);
+console.log('targeContent', targetContent);
+
+// 7. 将整理好的依赖填充进去 保存
+fs.writeFile(pathPodfile, targetContent, function(err) {
+	if (err) {
+		return console.log(err);
+	}
+
+	console.log('改写文件成功');
+});
